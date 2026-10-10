@@ -69,3 +69,26 @@ def test_limit_applies_after_filtering():
     assert count == 2
     assert len(filtered) == 1
     assert filtered[0]["changed_at"].endswith("03+01:00")
+
+def test_moira_short_home_restart_blip_is_ignored():
+    entity = "person.moira_hunt"
+    events = [
+        event(entity, "Sycam", 0),
+        event(entity, "home", 10),
+        event(entity, "Sycam", 13),
+    ]
+    filtered, count = summarize_activity_events(events, 50)
+    assert count == 0
+    assert filtered == []
+
+
+def test_moira_genuine_home_stay_is_kept():
+    entity = "person.moira_hunt"
+    events = [
+        event(entity, "Sycam", 0),
+        event(entity, "home", 1),
+        {"entity_id": entity, "state": "Sycam", "changed_at": "2026-10-10T15:05:00+01:00"},
+    ]
+    filtered, count = summarize_activity_events(events, 50)
+    assert count == 2
+    assert [item["state"] for item in filtered] == ["home", "Sycam"]
