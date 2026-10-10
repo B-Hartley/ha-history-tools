@@ -1,0 +1,113 @@
+"""Assist LLM tools for safely querying exposed Recorder history."""
+
+from __future__ import annotations
+
+import logging
+
+import probatio
+
+from homeassistant.components.llm import LLMTools
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.llm import (
+    LLM_API_ASSIST,
+    LLMContext,
+    Tool,
+    ToolAnnotations,
+    ToolInput,
+    ToolResult,
+)
+
+from .const import DOMAIN
+from .history import read_activity, read_history
+
+_LOGGER = logging.getLogger(__name__)
+
+READ_ONLY = ToolAnnotations(
+    read_only=True, destructive=False, idempotent=True, open_world=False
+)
+
+
+class EntityHistoryTool(Tool):
+    """Read recent state changes for named exposed entities."""
+
+    name = "ha_history_tools__get_entity_history"
+    title = "Get exposed entity history"
+    description = (
+        "Read Home Assistant state changes for 1-20 exact entity IDs during "
+        "the last 1-168 hours. Only entities currently exposed to this Assist "
+        "assistant are allowed. Use for door opening and appliance history."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = probatio.Schema({
+        probatio.Required("entity_ids"): [str],
+        probatio.Optional("hours", default=24): probatio.All(int, probatio.Range(min=1, max=168)),
+        probatio.Optional("limit", default=200): probatio.All(int, probatio.Range(min=1, max=500)),
+    })
+
+    async def async_call(
+        self, hass: HomeAssistant, tool_input: ToolInput, llm_context: LLMContext
+    ) -> ToolResult:
+        try:
+            data = await read_history(
+                hass, llm_context.assistant,
+                tool_input.tool_args["entity_ids"],
+                tool_input.tool_args.get("hours", 24),
+                tool_input.tool_args.get("limit", 200),
+            )
+            return ToolResult(data=data)
+        except (PermissionError, ValueError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+        except Exception:
+            _LOGGER.exception("Recorder entity history query failed")
+            return ToolResult(data={"error": "Recorder query unavailable"}, error=True)
+
+
+class RecentActivityTool(Tool):
+    """Read recent activity from exposed sensor entities only."""
+
+    name = "ha_history_tools__get_recent_activity"
+    title = "Get exposed household activity"
+    description = (
+        "Recent recorded door, motion, occupancy and person state transitions "
+        "from entities currently exposed to the requesting Assist assistant."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = probatio.Schema({
+        probatio.Optional("hours", default=2): probatio.All(int, probatio.Range(min=1, max=168)),
+        probatio.Optional("limit", default=100): probatio.All(int, probatio.Range(min=1, max=500)),
+    })
+
+    async def async_call(
+        self, hass: HomeAssistant, tool_input: ToolInput, llm_context: LLMContext
+    ) -> ToolResult:
+        try:
+            data = await read_activity(
+                hass, llm_context.assistant,
+                tool_input.tool_args.get("hours", 2),
+                tool_input.tool_args.get("limit", 100),
+            )
+            return ToolResult(data=data)
+        except (PermissionError, ValueError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+        except Exception:
+            _LOGGER.exception("Recorder recent activity query failed")
+            return ToolResult(data={"error": "Recorder query unavailable"}, error=True)
+
+
+@callback
+def async_get_tools(
+    hass: HomeAssistant, llm_context: LLMContext, api_id: str
+) -> LLMTools | None:
+    """Only expose tools via Assist and only when an assistant is identified."""
+    if api_id != LLM_API_ASSIST or not llm_context.assistant:
+        return None
+    return LLMTools(
+        tools=[EntityHistoryTool(), RecentActivityTool()],
+        prompt=(
+            "The HA History Tools offer read-only Recorder state changes for "
+            "currently exposed entities. Do not infer person identity from "
+            "motion events. Missing events are not proof of no movement."
+        ),
+    )
