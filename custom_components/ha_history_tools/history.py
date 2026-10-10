@@ -92,10 +92,54 @@ async def read_history(
     }
 
 
+def summarize_activity_events(
+    events: list[dict[str, str]], limit: int
+) -> tuple[list[dict[str, str]], int]:
+    """Keep meaningful transitions; discard initial/restore and unavailable noise.
+
+    For binary sensors, a valid OFF -> ON transition is the useful activity
+    event. For people, only transitions between two known, different
+    locations count. A preceding unknown/unavailable state always breaks
+    continuity, preventing startup restores from masquerading as activity.
+    """
+    per_entity: dict[str, list[dict[str, str]]] = {}
+    for event in events:
+        per_entity.setdefault(event["entity_id"], []).append(event)
+
+    activity: list[dict[str, str]] = []
+    for entity_id, changes in per_entity.items():
+        changes.sort(key=lambda e: e["changed_at"])
+        prior: str | None = None
+        for change in changes:
+            state = change["state"]
+            if state in {"unknown", "unavailable"}:
+                prior = None
+                continue
+            if prior is None:
+                prior = state
+                continue
+            if entity_id.startswith("binary_sensor."):
+                if prior == "off" and state == "on":
+                    activity.append({
+                        **change,
+                        "event": "activity_detected",
+                    })
+            elif entity_id.startswith("person.") and prior != state:
+                activity.append({
+                    **change,
+                    "event": "location_changed",
+                    "previous_state": prior,
+                })
+            prior = state
+    activity.sort(key=lambda e: e["changed_at"])
+    count = len(activity)
+    return activity[-limit:], count
+
+
 async def read_activity(
     hass: HomeAssistant, assistant: str | None, hours: int, limit: int
 ) -> dict[str, Any]:
-    """Discover recent activity only among currently exposed sensor entities."""
+    """Summarize genuine transitions on currently exposed activity entities."""
     validate_bounds(hours, limit)
     if not assistant:
         raise PermissionError("An Assist assistant context is required")
@@ -113,17 +157,27 @@ async def read_activity(
         and permitted(hass, assistant, state.entity_id)
     ]
     events: list[dict[str, str]] = []
+    source_truncated = False
     for offset in range(0, len(entities), MAX_ENTITIES):
         batch = entities[offset:offset + MAX_ENTITIES]
+        # Read *all* permitted events per batch, then discard restoration noise
+        # before applying the user-facing activity result limit.
         result = await read_history(hass, assistant, batch, hours, MAX_EVENTS)
+        source_truncated |= result["truncated"]
         events.extend(result["events"])
-    # Revalidate after *all* queries, not only after individual batches.
-    if any(not permitted(hass, assistant, event["entity_id"]) for event in events):
+    # Fail closed if exposure changes anywhere during the multi-batch query.
+    if any(not permitted(hass, assistant, entity) for entity in entities):
         raise PermissionError("Assist exposure changed during activity query; retry")
-    events.sort(key=lambda event: event["changed_at"])
+    filtered, count = summarize_activity_events(events, limit)
     return {
-        "events": events[-limit:],
-        "truncated": len(events) > limit,
+        "events": filtered,
+        "truncated": count > limit or source_truncated,
+        "source_truncated": source_truncated,
         "entity_count": len(entities),
-        "note": "Events indicate sensor activity, not who caused it.",
+        "note": (
+            "Only known-state transitions count. Initial states and restoration "
+            "from unavailable/unknown are ignored. A recorded motion or door "
+            "event does not identify a person. Truncated source history may "
+            "omit earlier activity."
+        ),
     }
