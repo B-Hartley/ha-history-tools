@@ -43,3 +43,9 @@ The tools use the **live Assist exposure list** associated with the actual reque
 This is a first-test build, **not yet validated on a live HA 2026.10 instance**. If it fails to load or tools are absent, open an issue or share the Home Assistant logs. Do not use as a security enforcement mechanism until the unexposed-entity and revocation tests pass.
 
 Logbook and statistics tools are not included in this first build.
+
+## Recent activity filtering (PR #1 update)
+
+The activity tool now reports only confirmed binary-sensor `off -> on` events and meaningful `person` location transitions. Initial readings and recovery from `unknown`/`unavailable` are ignored, avoiding false activity during Home Assistant restarts. Raw entity history remains unchanged for debugging. Filtering is deliberately conservative: an event at the very start of a query window with no previous known state will not be counted. The activity response reports source truncation if Recorder returns too many changes.
+
+Regression cases are in `tests/test_activity_filter.py` (run with `pytest -q tests/test_activity_filter.py` in a Home Assistant development environment). The tests have not yet been executed against a HA 2026.10 installation.
