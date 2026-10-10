@@ -49,3 +49,11 @@ Logbook and statistics tools are not included in this first build.
 The activity tool now reports only confirmed binary-sensor `off -> on` events and meaningful `person` location transitions. Initial readings and recovery from `unknown`/`unavailable` are ignored, avoiding false activity during Home Assistant restarts. Raw entity history remains unchanged for debugging. Filtering is deliberately conservative: an event at the very start of a query window with no previous known state will not be counted. The activity response reports source truncation if Recorder returns too many changes.
 
 Regression cases are in `tests/test_activity_filter.py` (run with `pytest -q tests/test_activity_filter.py` in a Home Assistant development environment). The tests have not yet been executed against a HA 2026.10 installation.
+
+## One-call home context
+
+Call `ha_history_tools__get_home_context` with `{}` as the first call when you want an overview of the house. It reads `sensor.home_start_here` plus up to nine linked semantic summaries in a single MCP request. It follows only defined summary pointer attributes and includes only entities currently exposed to the requesting Assist assistant. Context is deliberately bounded; large attributes may be omitted. The tool reports which linked summary keys are inaccessible.
+
+The companion `ha_history_tools__get_entity_details` tool accepts `{"entity_ids":["sensor.home_start_here","sensor.home_live_summary"]}` to inspect specific exposed entities and all attributes within size limits.
+
+Neither tool writes to Home Assistant. Both use live exposure checks. The one-call overview is a **current-state snapshot**, not a replacement for `GetEntityHistory`, `GetRecentActivity` or the separate Frigate camera connector. This build still needs a live installation check following restart.
