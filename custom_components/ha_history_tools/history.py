@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.homeassistant import async_should_expose
@@ -109,6 +109,25 @@ def summarize_activity_events(
     activity: list[dict[str, str]] = []
     for entity_id, changes in per_entity.items():
         changes.sort(key=lambda e: e["changed_at"])
+        # Moira's tracker can briefly restore as 'home' after HA restarts.
+        # Ignore only short home blips that are bracketed by known away states;
+        # do not erase prolonged home visits or raw Recorder history.
+        if entity_id == "person.moira_hunt":
+            normalized = []
+            for i, change in enumerate(changes):
+                if (
+                    change["state"] == "home"
+                    and 0 < i < len(changes) - 1
+                    and changes[i - 1]["state"] not in {"home", "unknown", "unavailable"}
+                    and changes[i + 1]["state"] not in {"home", "unknown", "unavailable"}
+                    and (
+                        datetime.fromisoformat(changes[i + 1]["changed_at"])
+                        - datetime.fromisoformat(change["changed_at"])
+                    ).total_seconds() <= 120
+                ):
+                    continue
+                normalized.append(change)
+            changes = normalized
         prior: str | None = None
         for change in changes:
             state = change["state"]
