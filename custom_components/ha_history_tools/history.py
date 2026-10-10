@@ -1,97 +1,107 @@
-"""Recorder history with strict live Assist exposure enforcement."""
+"""Read-only Recorder queries checked against live Assist entity exposure."""
 
 from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.components.homeassistant.exposed_entities import async_should_expose
+from homeassistant.components.homeassistant import async_should_expose
 from homeassistant.components.recorder import get_instance, history
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .const import MAX_ENTITIES, MAX_EVENTS, MAX_HOURS
 
-ASSISTANT = "conversation"
 
-
-def permitted(hass: HomeAssistant, entity_id: str) -> bool:
-    """Consult current Assist exposure on every call; never cache access."""
-    if not isinstance(entity_id, str) or "." not in entity_id:
+def permitted(hass: HomeAssistant, assistant: str | None, entity_id: str) -> bool:
+    """Only active entities exposed to the exact requesting assistant are permitted."""
+    if not assistant or not isinstance(entity_id, str) or "." not in entity_id:
         return False
     if hass.states.get(entity_id) is None:
         return False
     try:
-        return async_should_expose(hass, ASSISTANT, entity_id) is True
+        return async_should_expose(hass, assistant, entity_id) is True
     except (KeyError, ValueError, RuntimeError):
         return False
 
 
-def allowed_entities(hass: HomeAssistant, entities: list[str]) -> list[str]:
-    """Reject the entire request if any entity is not exposed."""
-    if not entities or len(entities) > MAX_ENTITIES or len(set(entities)) != len(entities):
-        raise ValueError("Provide 1-20 distinct entity IDs")
-    if not all(permitted(hass, entity) for entity in entities):
-        raise PermissionError("One or more entities are not exposed to Assist")
-    return entities
+def allowed_entities(hass: HomeAssistant, assistant: str | None, entities: list[str]) -> None:
+    """Reject the whole request when a requested entity is not permitted."""
+    if not isinstance(entities, list) or not 1 <= len(entities) <= MAX_ENTITIES:
+        raise ValueError("Provide 1-20 exact entity IDs")
+    if any(not isinstance(entity, str) for entity in entities):
+        raise ValueError("Entity IDs must be strings")
+    if len(set(entities)) != len(entities):
+        raise ValueError("Entity IDs must not be repeated")
+    if not all(permitted(hass, assistant, entity) for entity in entities):
+        raise PermissionError("An entity is not exposed to this Assist assistant")
 
 
-def validate_hours(hours: int) -> None:
-    if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= MAX_HOURS:
-        raise ValueError("hours must be an integer from 1 to 168")
+def validate_bounds(hours: int, limit: int) -> None:
+    """Reject invalid ranges, including bool values."""
+    if type(hours) is not int or not 1 <= hours <= MAX_HOURS:
+        raise ValueError("hours must be from 1 to 168")
+    if type(limit) is not int or not 1 <= limit <= MAX_EVENTS:
+        raise ValueError("limit must be from 1 to 500")
 
 
 async def read_history(
-    hass: HomeAssistant, entities: list[str], hours: int, limit: int = MAX_EVENTS
+    hass: HomeAssistant,
+    assistant: str | None,
+    entities: list[str],
+    hours: int,
+    limit: int = 200,
 ) -> dict[str, Any]:
-    """Read Recorder state changes; filter again before returning."""
-    validate_hours(hours)
-    allowed_entities(hass, entities)
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_EVENTS:
-        raise ValueError("limit must be an integer from 1 to 500")
+    """Read Recorder state transitions without requesting attributes."""
+    validate_bounds(hours, limit)
+    allowed_entities(hass, assistant, entities)
     end = dt_util.utcnow()
     start = end - timedelta(hours=hours)
-    result = await get_instance(hass).async_add_executor_job(
+    raw = await get_instance(hass).async_add_executor_job(
         history.get_significant_states,
         hass,
         start,
         end,
         entities,
         None,
-        False,  # no synthetic state at beginning of period
-        False,  # all state changes, not just 'significant' ones
-        False,
-        True,  # no attributes
+        False,  # do not include state from before the time period
+        False,  # include every state transition
+        False,  # non-minimal State instances
+        True,   # strip attributes
+        False,  # not compressed
     )
-    # Exposure may have been revoked while Recorder was being queried.
-    allowed_entities(hass, entities)
-    records: list[dict[str, str]] = []
+    # Fail the entire request if exposure changed during database access.
+    allowed_entities(hass, assistant, entities)
+    events: list[dict[str, str]] = []
     for entity in entities:
-        for state in result.get(entity, []):
-            if not hasattr(state, "state"):
-                continue
-            records.append({
+        for state in raw.get(entity, []):
+            events.append({
                 "entity_id": entity,
                 "state": state.state,
                 "changed_at": dt_util.as_local(state.last_changed).isoformat(),
             })
-    records.sort(key=lambda row: row["changed_at"])
-    truncated = len(records) > limit
-    if truncated:
-        records = records[-limit:]
+    events.sort(key=lambda event: event["changed_at"])
+    truncated = len(events) > limit
     return {
         "period_start": dt_util.as_local(start).isoformat(),
         "period_end": dt_util.as_local(end).isoformat(),
-        "events": records,
+        "events": events[-limit:],
         "truncated": truncated,
-        "notice": "Only currently Assist-exposed entities; event times are local.",
+        "total_events": len(events),
+        "note": "States are sensor reports; motion cannot identify a person.",
     }
 
 
-async def read_activity(hass: HomeAssistant, hours: int, limit: int) -> dict[str, Any]:
-    """Query only exposed door, motion, occupancy and person entities."""
-    candidates = [
-        state.entity_id for state in hass.states.async_all()
+async def read_activity(
+    hass: HomeAssistant, assistant: str | None, hours: int, limit: int
+) -> dict[str, Any]:
+    """Discover recent activity only among currently exposed sensor entities."""
+    validate_bounds(hours, limit)
+    if not assistant:
+        raise PermissionError("An Assist assistant context is required")
+    entities = [
+        state.entity_id
+        for state in hass.states.async_all()
         if (
             state.domain == "person"
             or (
@@ -100,22 +110,20 @@ async def read_activity(hass: HomeAssistant, hours: int, limit: int) -> dict[str
                 in {"door", "motion", "occupancy", "opening", "presence"}
             )
         )
-        and permitted(hass, state.entity_id)
+        and permitted(hass, assistant, state.entity_id)
     ]
-    if not candidates:
-        return {"events": [], "notice": "No exposed activity entities"}
-    validate_hours(hours)
-    # Query chunks to keep calls bounded; ensure maximum entity count per batch.
-    all_events: list[dict[str, str]] = []
-    for offset in range(0, len(candidates), MAX_ENTITIES):
-        result = await read_history(hass, candidates[offset:offset + MAX_ENTITIES], hours, MAX_EVENTS)
-        all_events.extend(result["events"])
-    # Check exposure *again* after collecting all batches, before any data leaves.
-    all_events = [event for event in all_events if permitted(hass, event["entity_id"])]
-    all_events.sort(key=lambda row: row["changed_at"])
+    events: list[dict[str, str]] = []
+    for offset in range(0, len(entities), MAX_ENTITIES):
+        batch = entities[offset:offset + MAX_ENTITIES]
+        result = await read_history(hass, assistant, batch, hours, MAX_EVENTS)
+        events.extend(result["events"])
+    # Revalidate after *all* queries, not only after individual batches.
+    if any(not permitted(hass, assistant, event["entity_id"]) for event in events):
+        raise PermissionError("Assist exposure changed during activity query; retry")
+    events.sort(key=lambda event: event["changed_at"])
     return {
-        "events": all_events[-limit:],
-        "truncated": len(all_events) > limit,
-        "entity_count": len(candidates),
-        "notice": "Events can indicate activity, not identify who caused it.",
+        "events": events[-limit:],
+        "truncated": len(events) > limit,
+        "entity_count": len(entities),
+        "note": "Events indicate sensor activity, not who caused it.",
     }
