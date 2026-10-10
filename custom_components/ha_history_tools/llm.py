@@ -18,6 +18,7 @@ from homeassistant.helpers.llm import (
 )
 
 from .const import DOMAIN
+from .details import read_entity_details
 from .history import read_activity, read_history
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,6 +97,37 @@ class RecentActivityTool(Tool):
             return ToolResult(data={"error": "Recorder query unavailable"}, error=True)
 
 
+class EntityDetailsTool(Tool):
+    """Return current state and bounded attributes for exposed entities."""
+
+    name = "ha_history_tools__get_entity_details"
+    title = "Get exposed entity details and attributes"
+    description = (
+        "Read current states and attributes for 1-10 exact entity IDs, including "
+        "semantic Home Start Here guidance. Only currently Assist-exposed "
+        "entities are allowed. Results may truncate oversized attributes."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = probatio.Schema({
+        probatio.Required("entity_ids"): [str],
+    })
+
+    async def async_call(
+        self, hass: HomeAssistant, tool_input: ToolInput, llm_context: LLMContext
+    ) -> ToolResult:
+        try:
+            data = read_entity_details(
+                hass, llm_context.assistant, tool_input.tool_args["entity_ids"]
+            )
+            return ToolResult(data=data)
+        except (PermissionError, ValueError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+        except Exception:
+            _LOGGER.exception("Exposed entity details query failed")
+            return ToolResult(data={"error": "Entity details unavailable"}, error=True)
+
+
 @callback
 def async_get_tools(
     hass: HomeAssistant, llm_context: LLMContext, api_id: str
@@ -104,9 +136,9 @@ def async_get_tools(
     if api_id != LLM_API_ASSIST or not llm_context.assistant:
         return None
     return LLMTools(
-        tools=[EntityHistoryTool(), RecentActivityTool()],
+        tools=[EntityHistoryTool(), RecentActivityTool(), EntityDetailsTool()],
         prompt=(
-            "The HA History Tools offer read-only Recorder state changes for "
+            "The HA History Tools offer read-only Recorder history and current entity details for "
             "currently exposed entities. Do not infer person identity from "
             "motion events. Missing events are not proof of no movement."
         ),
