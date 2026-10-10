@@ -19,6 +19,7 @@ from homeassistant.helpers.llm import (
 
 from .const import DOMAIN
 from .details import read_entity_details
+from .home_context import read_home_context
 from .history import read_activity, read_history
 
 _LOGGER = logging.getLogger(__name__)
@@ -128,6 +129,32 @@ class EntityDetailsTool(Tool):
             return ToolResult(data={"error": "Entity details unavailable"}, error=True)
 
 
+class HomeContextTool(Tool):
+    """Fetch Home Start Here guidance and linked live summaries in one request."""
+
+    name = "ha_history_tools__get_home_context"
+    title = "Get complete home starting context"
+    description = (
+        "Recommended first tool call for a home status question. Reads Home "
+        "Start Here plus up to nine linked, exposed summary sensors in one call. "
+        "For past activity use history; for visual evidence use Frigate."
+    )
+    integration = DOMAIN
+    annotations = READ_ONLY
+    parameters = probatio.Schema({})
+
+    async def async_call(
+        self, hass: HomeAssistant, tool_input: ToolInput, llm_context: LLMContext
+    ) -> ToolResult:
+        try:
+            return ToolResult(data=read_home_context(hass, llm_context.assistant))
+        except (PermissionError, ValueError) as exc:
+            return ToolResult(data={"error": str(exc)}, error=True)
+        except Exception:
+            _LOGGER.exception("Home context query failed")
+            return ToolResult(data={"error": "Home context unavailable"}, error=True)
+
+
 @callback
 def async_get_tools(
     hass: HomeAssistant, llm_context: LLMContext, api_id: str
@@ -136,7 +163,7 @@ def async_get_tools(
     if api_id != LLM_API_ASSIST or not llm_context.assistant:
         return None
     return LLMTools(
-        tools=[EntityHistoryTool(), RecentActivityTool(), EntityDetailsTool()],
+        tools=[EntityHistoryTool(), RecentActivityTool(), EntityDetailsTool(), HomeContextTool()],
         prompt=(
             "The HA History Tools offer read-only Recorder history and current entity details for "
             "currently exposed entities. Do not infer person identity from "
